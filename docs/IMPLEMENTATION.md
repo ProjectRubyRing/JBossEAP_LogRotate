@@ -8,7 +8,7 @@
 | # | 対象 | ファイル | 効果 |
 |---|------|---------|------|
 | 1 | JVM / コンテナ TZ | `jboss/conf/01-timezone.conf`, `ecs/taskdef-timezone-snippet.json` | ローテート境界とファイル名を JST 化 |
-| 2 | JBoss EAP server.log | `jboss/cli/10-logging-rotation-jst.cli` | 日次+サイズローテート、オフセット印字 |
+| 2 | JBoss EAP server.log | `jboss/cli/10-logging-rotation-jst.cli` | 日次+サイズローテート、オフセット印字、**起動時退避（RC-5 対策）** |
 | 3 | アプリログ（tracelog 等） | `logback/logback-spring.xml`, `ecs/entrypoint-log-instance-id.sh` | TZ 固定 + タスク固有ディレクトリ |
 | 4 | CloudWatch Agent | `cloudwatch-agent/amazon-cloudwatch-agent.json` | `%z` 解釈、glob 修正、multiline |
 
@@ -68,9 +68,11 @@ CLI が使えない場合は `jboss/standalone-logging-snippet.xml` の内容で
 
 ```
 handler   : periodic-size-rotating-file-handler (旧: periodic-rotating-file-handler)
-suffix    : .yyyy-MM-dd          … JVM 既定 TZ (=JST) で解釈 → 1 ファイル = 1 JST 日
-rotate-size / max-backup-index   … 同一日内のサイズ超過は .1 .2 … の連番
-append=true / autoflush=true / rotate-on-boot=false
+suffix    : .yyyy-MM-dd          … JVM 既定 TZ (=JST) で解釈 → 1 JST 日 = 1 グループ
+rotate-size=100m                 … 同一日内のサイズ超過で連番を作る閾値
+max-backup-index=20              … 連番の保持世代数（0 にすると rotate-on-boot が無効化される）
+append=true / autoflush=true
+rotate-on-boot=true              … RC-5 対策: 起動時に既存 server.log を退避
 formatter : %d{yyyy-MM-dd HH:mm:ss,SSSZ} %-5p [%c] (%t) %s%e%n
 ```
 
@@ -79,6 +81,10 @@ formatter : %d{yyyy-MM-dd HH:mm:ss,SSSZ} %-5p [%c] (%t) %s%e%n
 ```
 2026-09-02 00:14:03,424+0900 INFO  [com.example.Foo] (default task-1) processed
 ```
+
+**`periodic-rotating-file-handler` には `rotate-on-boot` 属性が無い。**
+RC-5 を塞ぐには `periodic-size-rotating-file-handler` への型変換が必須で、
+本 CLI はその変換も併せて行う。
 
 ### 2-3. 出力先はタスク固有ディレクトリを維持すること
 
@@ -95,6 +101,82 @@ formatter : %d{yyyy-MM-dd HH:mm:ss,SSSZ} %-5p [%c] (%t) %s%e%n
 
 `suffix` を `.yyyy-MM-dd-HH` に変更すると毎時ローテートになる。
 その場合 `tools/verify-log-rotation.sh` は `GRAN=hour` で実行すること。
+
+### 2-5. `rotate-on-boot=true` の意味と確認（RC-5 対策）
+
+#### 何が変わるか
+
+| | 変更前 (`rotate-on-boot=false`) | 変更後 (`rotate-on-boot=true`) |
+|--|-------------------------------|------------------------------|
+| 再起動直後の書き込み先 | 前プロセスが残した `server.log` に**追記** | **空の新しい** `server.log` |
+| 前プロセス分の確定名 | mtime 由来の日付（クラッシュ前日になりうる） | `server.log.<起動日>.1` |
+| 1 ファイルの中身 | 再起動を跨いで混在しうる | **1 ファイル = 1 起動** |
+| 正しさの担保 | 「境界判定が毎回当たること」に依存 | **構造で保証**（書き込み前に退避） |
+
+理屈は `docs/ANALYSIS_UTC_JST.md` §3.5 を参照。
+
+#### 発火条件（設定しても症状が変わらないときは、まずここを見る）
+
+```java
+rotateOnBoot && maxBackupIndex > 0 && file.exists() && file.length() > 0
+```
+
+- `max-backup-index=0` だと **エラーも警告も無く無効化**される。
+- **起動時に `server.log` が存在しない経路では発火しない。**
+  ECS でタスクごとに `mid/<TASK_INSTANCE_ID>/` が変わる構成がこれに当たる。
+  その経路ではそもそも RC-5 が起きていない（分析書 §3.5.4 の表で確認すること）。
+
+#### 副作用（承知の上で採用している）
+
+1. **退避ファイルの日付は「起動日」**。09-01 の内容が 09-02 の起動で退避されると
+   `server.log.2026-09-02.1` になる。ファイル名ではなく**行の時刻（`+0900` 付き）を正**とする。
+   `tools/verify-log-rotation.sh` はこれを `[BOOT-ROT]` として異常と区別する。
+2. **1 起動につき連番を 1 つ消費**する（`.max` を削除 → `.N` を `.N+1` へシフト → `server.log` を `.1` へ）。
+   `.1` が最新（逆時系列）。`max-backup-index=20` なら同一日に 20 回の再起動で当日分が一巡する。
+   保険は CloudWatch Logs 側（`autoflush=true` により行は書かれた時点で送信済み）。
+3. **適用直後の 1 回だけ**、logging サブシステム初期化前のブート数行が退避側の末尾に入る
+   （`configuration/logging.properties` が現行モデルから再生成されるのは次回起動時のため）。
+
+#### 動作確認
+
+サーバを 2 回起動して、退避が起きていることを実測する。
+
+```bash
+LOGDIR=/mnt/logs/front-svc/mid/task-abc123   # jboss.server.log.dir
+
+# 1 回目の起動 → 適当に稼働させて server.log にログを溜める
+ls -la "$LOGDIR"
+#   server.log
+
+# サーバを停止（異常終了の再現なら kill -9 でよい）
+# 2 回目の起動
+ls -la "$LOGDIR"
+#   server.log            ← 空から始まっている（先頭行が今回の起動ログ）
+#   server.log.<起動日>.1  ← 前回稼働分がここへ退避されている
+
+# 期待どおりなら、新しい server.log の先頭は必ず今回の起動ログになる
+head -3 "$LOGDIR/server.log"
+
+# 退避側の末尾は前回の停止時刻で終わっている（副作用 3 の数行を除く）
+tail -3 "$LOGDIR/server.log.<起動日>.1"
+```
+
+**判定基準**
+
+| 観測 | 判定 |
+|------|------|
+| 新 `server.log` の先頭が今回の起動ログ | ✅ RC-5 は解消 |
+| 新 `server.log` の先頭が前回稼働中のログ | ❌ 退避が発火していない → 発火条件と `max-backup-index` を確認 |
+| `server.log.<日付>.1` が増えていない | ❌ 同上 |
+| 退避側の末尾に今回の起動ログが数行ある | ⚠️ 副作用 3。もう一度再起動して消えれば正常 |
+
+CLI 適用後の属性確認:
+
+```bash
+$JBOSS_HOME/bin/jboss-cli.sh -c \
+  '/subsystem=logging/periodic-size-rotating-file-handler=FILE:read-resource(include-defaults=true)'
+# rotate-on-boot => true / max-backup-index => 20 / append => true の 3 点を確認
+```
 
 ---
 
@@ -191,6 +273,33 @@ date                                         # -> JST（tzdata を入れた場�
 **不定かつ大きい**なら RC-3（多重書き込み）、
 **数秒以内**なら RC-2（境界の染み出し・許容範囲）。
 
+#### `[BOOT-ROT]` の扱い（rotate-on-boot=true 適用後）
+
+`rotate-on-boot=true` にすると、退避ファイルは「起動日」の名前を持ちつつ
+中身は前日以前から始まる（§2-5 副作用 1）。これは**異常ではない**ため、
+本ツールは連番付きファイル（`base.<日付>.<N>`）で
+**前方はみ出しのみ・後方はみ出し無し**のものを `[BOOT-ROT]` として分類し、
+異常件数に数えない。
+
+```
+[BOOT-ROT] server.log.2026-09-02.1  (day単位)
+            ファイル名の期間 : 2026-09-02 00:00:00+0900 〜 2026-09-02 23:59:59+0900
+            中身の時刻範囲   : 2026-09-01 20:11:04+0900 〜 2026-09-01 23:58:41+0900
+            前方はみ出し     : 14340 秒 (4.0 時間)  ← 起動時退避によるもの（正常）
+```
+
+適用前の構成（`rotate-on-boot=false`）を検査するときは
+`ROTATE_ON_BOOT=false` を指定する。この場合は従来どおり `[UNDERRUN]` として
+異常に数えられる。
+
+```bash
+ROTATE_ON_BOOT=false ./tools/verify-log-rotation.sh /mnt/logs/front-svc/mid
+```
+
+**受け入れ基準**: 適用後は「異常: 0 件」。`[BOOT-ROT]` は件数が出てよいが、
+その件数は**再起動回数と一致するはず**である。一致しない場合は
+RC-2/RC-3 と混同していないか個別に確認すること。
+
 > `tools/verify-log-rotation.sh` は tzdata の無い環境で
 > `TZ=Asia/Tokyo` が無言で UTC に落ちることを自前で検出して停止する。
 > その場合は `TZ_EXPECT=JST-9` を指定するか、tzdata を導入すること。
@@ -248,6 +357,17 @@ ls -la /mnt/logs/front-svc/
 - **日付サフィックス付きファイルの世代管理。**
   JBoss の `max-backup-index` はサイズ連番にしか効かない。
   EFS ライフサイクル管理（IA 移行）＋定期削除ジョブが別途必要。
+  `rotate-on-boot=true` により、この連番は「サイズ超過」と「起動時退避」の
+  両方で消費されるようになった点に注意（`.1` が最新の逆時系列）。
+- **クラッシュループ時の EFS 上の世代喪失。**
+  同一日に `max-backup-index` 回を超えて再起動すると、当日の古い退避分から消える。
+  `autoflush=true` により CloudWatch Logs 側には残るため実害は限定的だが、
+  EFS 上での完全保全が要件なら `max-backup-index` の引き上げを検討する。
+- **Logback 側の RC-5。**
+  `TimeBasedRollingPolicy` にも同じ構造（既存ファイルの `lastModified` から
+  現在周期を決める）があるが、`rotate-on-boot` 相当の属性が無い。
+  ECS のタスク固有ディレクトリ構成では発生しにくいため現状維持とした。
+  詳細と選択肢は `docs/ANALYSIS_UTC_JST.md` §7-8。
 - **終了済みタスクのディレクトリ掃除。**
   `<task-id>/` と `mid/<task-id>/` の定期削除（例: 90 日超）。
 - **CloudWatch Agent の state 永続化。**

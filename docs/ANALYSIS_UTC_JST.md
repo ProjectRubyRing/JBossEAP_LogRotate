@@ -17,9 +17,12 @@
 | **RC-2** | ローテートは「境界時刻」ではなく「境界後の最初の書き込み」で起きる（遅延ローテート）。行の時刻は *生成時刻*、ローテート判定は *書き込み時刻* | 数百 ms 〜 数秒 | 全ファイルログ |
 | **RC-3** | EFS のサービス共有ディレクトリに **複数タスクが同名ファイルへ書き込む**。`rename` 後も旧 inode へ書き続ける | **無制限（数時間〜）** | アプリログ（tracelog 等）※ server.log はタスク固有 dir のため対象外 |
 | **RC-4** | CloudWatch Agent が JST のタイムスタンプを **UTC として解釈**（`timezone: "Local"` かつサイドカー TZ=UTC） | **9 時間** | CloudWatch Logs 上のイベント時刻 |
+| **RC-5** | **異常終了後の再起動**が、クラッシュしたプロセスの残した `server.log` に追記を続ける。ファイル名は中身ではなく `lastModified` から決まる | **無制限（再起動後セッション全体）** | server.log（`append=true` かつ `rotate-on-boot=false` のとき） |
 
 **RC-1 が本件の主因**であり、ご指摘の「UTC と JST の関係」そのものである。
 RC-3 は「ファイル名と中身が無関係になる」最悪ケースを作るため、稼働統計を取る前に必ず塞ぐ必要がある。
+**RC-5 は RC-3 の“時間軸版”**（同じファイルを 2 つのプロセスが *空間的* に共有するのが RC-3、
+*時間的* に共有するのが RC-5）であり、対策も同じ「1 ファイル = 1 プロセス」の徹底になる。
 
 ---
 
@@ -162,6 +165,217 @@ JBoss 側は逆向きも起きる。`async-handler` を挟むと生成時刻順�
 
 ---
 
+## 3.5. RC-5: 異常終了後の再起動が「ローテート前の日付」のファイルに入る
+
+> 報告事象:
+> 「異常終了して再起動したあとのログが、ローテーション前の日付が付いた
+>   `server.log.<前日>` に書き込まれている」
+
+RC-3 が「同じファイルを **複数タスクが空間的に共有**する」問題なのに対し、
+RC-5 は「同じファイルを **クラッシュ前後のプロセスが時間的に共有**する」問題である。
+`server.log` がタスク固有ディレクトリにあっても、**同じディレクトリで JVM が
+起動し直る限り発生する**（→ §3.5.4）。
+
+### 3.5.1 前提となる 2 つの実装事実
+
+`org.jboss.logmanager.handlers.PeriodicRotatingFileHandler` の実装（jboss-logmanager 2.x）:
+
+```java
+// ① ファイルを開いた *後* に、ファイルの mtime からローテート情報を作る
+public void setFile(final File file) throws FileNotFoundException {
+    synchronized (outputLock) {
+        super.setFile(file);                       // FileOutputStream(file, append) で open
+        if (format != null && file != null && file.lastModified() > 0) {
+            calcNextRollover(file.lastModified()); // ← mtime が基準
+        }
+    }
+}
+
+// ② ローテートは *タイマーではなく書き込み契機*
+protected void preWrite(final ExtLogRecord record) {
+    final long recordMillis = record.getMillis();
+    if (recordMillis >= nextRollover) {
+        rollOver();                    // server.log → server.log + nextSuffix
+        calcNextRollover(recordMillis);
+    }
+}
+
+private void calcNextRollover(final long fromTime) {
+    ...
+    nextSuffix = format.format(new Date(fromTime));   // ← ファイル名はここで決まる
+    ...
+}
+```
+
+ここから導かれる性質は 2 つ:
+
+| # | 性質 | 帰結 |
+|---|------|------|
+| A | `append=true` で開いても mtime は更新されない（`FileOutputStream(file, true)` は truncate しない）。したがって `nextSuffix` は **クラッシュ直前の最終書き込み時刻**から作られる | ファイル名は「中身の日付」ではなく「mtime の日付」 |
+| B | 境界判定は `preWrite` でしか行われない。**書き込みが起きるまでローテートは起きない** | 境界判定が 1 回でも外れると、以後そのファイルは古い `nextSuffix` のまま確定する |
+
+### 3.5.2 事象が成立する経路
+
+`append=true` + `rotate-on-boot=false` では、**再起動したプロセスは
+クラッシュしたプロセスが残した物理ファイルにそのまま追記する**。
+その物理ファイルが最終的にどの名前で確定するかは、A のとおり
+**クラッシュ前の mtime** で決まっている。
+
+```
+09-01 23:58  最後の書き込み → server.log の mtime = 09-01 23:58
+09-01 23:59  異常終了（JVM が buffer を flush しきらずに死ぬ）
+09-02 00:05  再起動
+             setFile(server.log)
+               → append で open（mtime は 09-01 23:58 のまま）
+               → calcNextRollover(09-01 23:58)
+                    nextSuffix  = ".2026-09-01"      ← 前日で確定
+                    nextRollover = 09-02 00:00:00
+09-02 00:05〜 再起動後のログを **同じ物理ファイル** に追記
+             → 後でこのファイルは server.log.2026-09-01 という名前で確定する
+```
+
+境界判定（B）が正しく発火すれば、最初の 1 行で `rollOver()` が走って分離される。
+しかし発火は次の条件に依存しており、**異常終了の周辺はまさにその条件が崩れる場面**である。
+
+| 発火が外れる条件 | 異常終了時に起きる理由 |
+|-----------------|---------------------|
+| `mtime` が最終ログ行より **新しい** | EFS(NFS) はクライアントの flush/close 契機で mtime を更新する。監視・バックアップ・`cp` などが触っても更新される。→ `nextRollover` が実際より未来に押し出され、境界をまたいだ再起動でも発火しない |
+| `record.getMillis()` の順序が書き込み順と違う | `async-handler` を挟んでいる場合（RC-2 と同根）。境界後のレコードで先にローテートし、境界前のレコードが新ファイルへ落ちる／その逆 |
+| クラッシュで失われた分だけ mtime と内容がずれる | `autoflush=false` の区間や OS バッファに残った分は、mtime だけ進んで内容が無い |
+
+**要するに `rotate-on-boot=false` は、「境界判定が毎回正しく当たること」に
+correctness を賭けている構成である。** 通常運用では当たるが、異常終了はその
+前提が崩れる典型ケースであり、外れたときの被害は「再起動後セッション丸ごと」と
+無制限になる。
+
+### 3.5.3 併発する二次被害: ローテート済みファイルの上書き
+
+`rollOver()` が使う退避処理は **インデックス無しの 3 引数版**である。
+
+```java
+// PeriodicRotatingFileHandler#rollOver
+suffixRotator.rotate(errorManager, file.toPath(), nextSuffix);
+
+// SuffixRotator#rotate(ErrorManager, Path, String)  →  最終的に
+Files.move(src, target, StandardCopyOption.REPLACE_EXISTING);   // ← 既存を破壊する
+```
+
+つまり遅延ローテートで `server.log.2026-09-01` を作るとき、
+**同名ファイルが既にあれば警告なく上書き消滅する**。
+同一日に複数回クラッシュ／再起動していると、先に確定していた分が失われる。
+
+### 3.5.4 どの経路で実際に起きるか（重要）
+
+`rotate-on-boot` の発火条件は次のとおり（`PeriodicSizeRotatingFileHandler#setFile`）:
+
+```java
+if (rotateOnBoot && maxBackupIndex > 0 && file != null && file.exists() && file.length() > 0L) { ... }
+```
+
+**「起動時に `server.log` が既に存在する」ことが前提**である。したがって:
+
+| 経路 | 起動時に server.log が既存か | RC-5 | rotate-on-boot |
+|------|--------------------------|------|----------------|
+| ECS で **タスクごと置き換わる**（TaskARN が変わる → `mid/<TASK_INSTANCE_ID>/` が新規） | 存在しない | 起きない | 発火しない（無害） |
+| 同一タスク内で**コンテナだけ再起動**する | 存在する | **起きる** | 発火する |
+| EC2 / オンプレの**固定ログディレクトリ** | 存在する | **起きる** | 発火する |
+| `LOG_INSTANCE_ID` を固定値・ホスト名等で運用している | 存在する | **起きる** | 発火する |
+| ゾンビ JVM が残ったまま新 JVM が起動 | 存在する | **起きる**（RC-3 も併発） | 発火するが、旧 JVM の fd は旧 inode に残る |
+
+> **設定しても症状が変わらない場合はこの表を先に確認すること。**
+> 「タスクごとに新しいディレクトリになる」経路では RC-5 はそもそも起きず、
+> `rotate-on-boot=true` は何もしない（設定して害は無い）。
+
+### 3.5.5 対策: `rotate-on-boot=true`
+
+`periodic-size-rotating-file-handler` の `rotate-on-boot=true` は、
+**`setFile` の中で、最初の 1 行が書かれるより前に**既存ファイルを退避する。
+
+```java
+// PeriodicSizeRotatingFileHandler#setFile
+if (rotateOnBoot && maxBackupIndex > 0 && file != null && file.exists() && file.length() > 0L) {
+    final String suffix = getNextSuffix();
+    ...
+    setFileInternal(null, false);                                    // 先に閉じる
+    suffixRotator.rotate(getErrorManager(), file.toPath(), suffix, maxBackupIndex);
+}
+setFileInternal(file, false);                                        // 空ファイルから開始
+```
+
+これで **§3.5.2 の前提（クラッシュ前のファイルへ追記する）が成立しなくなる**。
+境界判定が当たるかどうかに correctness を賭けるのをやめ、
+「1 起動 = 1 ファイル」を構造で保証する形に変わる。
+§3.5.3 の上書き破壊も、退避先が `.1` 側（連番シフト）になるため起きなくなる。
+
+> `periodic-rotating-file-handler` には `rotate-on-boot` 属性が **無い**。
+> RC-5 を塞ぐには `periodic-size-rotating-file-handler` への型変換が必須である。
+
+#### 採用に伴う 3 つの副作用（いずれも許容だが、知らないと誤診する）
+
+**副作用 1: 退避ファイルの日付は「内容の日付」ではなく「起動日」になる**
+
+WildFly の属性適用順は
+`..., ROTATE_ON_BOOT, SUFFIX, NAMED_FORMATTER, FILE`
+（`PeriodicSizeRotatingHandlerResourceDefinition#ATTRIBUTES`）。
+`suffix` を適用する時点では `file` がまだ未設定なので、`setSuffix()` の中では
+
+```java
+final File file = getFile();
+if (file != null && file.lastModified() > 0) { now = file.lastModified(); }
+else { now = System.currentTimeMillis(); }     // ← こちらが選ばれる
+calcNextRollover(now);
+```
+
+**起動時刻**が使われる。つまり退避先は `server.log.<起動日>.1`。
+
+```
+09-01 20:00 の内容を持つ server.log を 09-02 10:00 に起動して退避
+   → server.log.2026-09-02.1   （中身は 09-01 のログ）
+```
+
+日付が **前方に** ずれる。RC-5 の元事象（後方にずれる = 前日名のファイルに翌日分が入る）
+とは逆向きで、かつ **1 ファイル内の混在が起きない**点が決定的に違う。
+「ファイル名の日付」を正にする運用はいずれにせよ破綻するため、
+方針 2（行にオフセットを印字）と方針 4（統計はイベント時刻から取る）が前提条件になる。
+`tools/verify-log-rotation.sh` はこのパターンを `[BOOT-ROT]` として
+RC-1 / RC-3 の異常と区別する。
+
+**副作用 2: 1 起動につき連番を 1 つ消費する**
+
+退避は 4 引数版 `SuffixRotator#rotate(em, src, suffix, maxBackupIndex)` で行われ、
+`.max` を削除 → `.N` を `.N+1` へシフト → `server.log` を `.1` へ、という順で動く。
+つまり **`.1` が最新**（逆時系列）であり、`max-backup-index=20` なら
+**同一日に 20 回再起動すると当日の最古世代から消えていく**。
+
+- クラッシュループ（CrashLoopBackOff）では数分で一巡しうる。
+- 保険は CloudWatch Logs 側にある。`autoflush=true` により行は即座に
+  Agent へ渡っているため、**EFS 上の世代が消えてもイベントは残る**。
+  これが方針 4（統計・調査はイベント時刻を正とする）を採る実利でもある。
+- ECS でタスクごとにディレクトリが変わる経路では、そもそも退避が発生しないため無関係。
+
+**副作用 3: 設定変更後の初回起動だけ、ブートの数行が退避側に入る**
+
+logging サブシステム初期化前のブートメッセージは `standalone.xml` ではなく
+`standalone/configuration/logging.properties` の設定で書かれる。同ファイルは
+現行モデルから再生成されるため、`rotate-on-boot=true` が反映されるのは
+**次回起動から**である。したがって適用直後の 1 回だけ、
+ブート数行が退避側ファイルの末尾に残る。
+
+影響は「数行・サブ秒」であり、RC-5 本体（再起動後セッション丸ごと・無制限）とは
+桁が違う。実測手順は `docs/IMPLEMENTATION.md` §2-5。
+
+#### 不採用にした代替案
+
+| 案 | 不採用理由 |
+|----|-----------|
+| `append=false` | 退避ではなく **truncate**。クラッシュ直前のログ（＝障害解析で最も必要な部分）を破壊する。症状は消えるが原因調査ができなくなる |
+| `rotate-on-boot=false` のまま `autoflush=true` で mtime 精度を上げる | 発火条件の一部（mtime のずれ）しか潰せない。`async-handler` 経路と EFS の mtime 更新契機は残る。「境界判定が毎回当たること」に賭ける構造自体が変わらない |
+| 起動スクリプトで `server.log` を `mv` してから起動 | 実質同じことを外部で行う案。JVM 起動前に確実に動く利点はあるが、退避規則が JBoss 側と二重管理になり、`max-backup-index` による世代管理も効かない。EAP の属性で足りるなら属性で行う |
+| suffix を毎時（`.yyyy-MM-dd-HH`）にして被害時間を縮める | 混入の *時間幅* が縮むだけで混入自体は残る。EFS 上のファイル数は 24 倍になる |
+| ログ行の時刻だけを信じ、ファイル名の不整合は運用で許容 | 方針としては正しく、本実装でも方針 4 として採用している。ただし「EFS 上で人間が直接 grep する」調査導線が壊れたままになるため、**併用**であって代替ではない |
+
+---
+
 ## 4. RC-4: CloudWatch Agent 側のタイムスタンプ解釈
 
 現行 `CWA_Sidecar_Generator/cloudwatch-agent-config.json`:
@@ -225,10 +439,24 @@ JBoss 側は逆向きも起きる。`async-handler` を挟むと生成時刻順�
 - 過去ログ（オフセット無し・UTC）と新ログ（オフセット有り・JST）が
   **見た目で判別できる**ため、移行期の混乱を防げる
 
-### 方針 3: 「1 ファイル = 1 プロセス」を構造的に保証する
+### 方針 3: 「1 ファイル = 1 プロセス」を構造的に保証する（空間軸と時間軸の両方）
 
-アプリログの出力先を **タスク固有ディレクトリ**にする
+**空間軸（RC-3）**: アプリログの出力先を **タスク固有ディレクトリ**にする
 （JBoss ログが既に採用している `mid/<TASK_INSTANCE_ID>` と同じ思想）。
+
+**時間軸（RC-5）**: JBoss の `FILE` ハンドラに `rotate-on-boot=true` を設定し、
+起動時点で前プロセスのファイルを退避して**空ファイルから書き始める**。
+「同じ物理ファイルを 2 つのプロセスが共有しない」という同一の原則を、
+空間（同時刻の別タスク）と時間（クラッシュ前後の別プロセス）の両方に適用する。
+
+| 軸 | 共有の形 | 根本原因 | 対策 | 実装ファイル |
+|----|---------|---------|------|------------|
+| 空間 | 同時刻の複数タスクが同名ファイルを開く | RC-3 | タスク固有ディレクトリ | `ecs/entrypoint-log-instance-id.sh`, `logback/logback-spring.xml` |
+| 時間 | クラッシュ前後のプロセスが同一ファイルを開く | RC-5 | `rotate-on-boot=true` | `jboss/cli/10-logging-rotation-jst.cli` |
+
+> `rotate-on-boot` は `max-backup-index > 0` かつ「起動時に対象ファイルが既存」の
+> ときだけ発火する。ECS でタスクごとにディレクトリが変わる経路では発火しない
+> （そもそも RC-5 も起きない）。→ §3.5.4
 
 ```
 /mnt/logs/<svc>/<TASK_INSTANCE_ID>/tracelog            ← 実体（1 タスク専有）
@@ -284,9 +512,12 @@ fields (toMillis(@timestamp) + 9 * 3600 * 1000) / 3600000 % 24 as jst_hour
 | `server.log.2026-09-01` の中身 | 同上 | **JST 09-01 の 1 日分** |
 | ログ行 | `2026-09-01 15:14:03.424`（TZ 不明） | `2026-09-02 00:14:03,424+0900`（自己記述） |
 | ローテート済みファイルへの追記 | 起こりうる（RC-3） | **起こらない**（1 ファイル = 1 タスク） |
+| 異常終了後の再起動ログ | 前プロセスのファイルへ追記され、前日名で確定しうる（RC-5・無制限） | **起動時に退避され、必ず空ファイルから始まる** |
+| 再起動を跨ぐ 1 ファイル内の混在 | 起こりうる（RC-5） | **起こらない**（1 ファイル = 1 起動） |
 | CloudWatch のイベント時刻 | UTC 解釈（JST 化した瞬間 9h ずれる） | `%z` により常に正しい |
-| JST 日次統計 | 2 ファイル連結 + 再フィルタが必要 | **1 ファイル = 1 JST 日** |
+| JST 日次統計 | 2 ファイル連結 + 再フィルタが必要 | **1 JST 日 = 1 グループ**（`server.log.<日付>` + `<日付>.N`） |
 | 境界付近のずれ | 秒オーダー（RC-2） | 秒オーダー（残存。統計はイベント時刻で取るため実害なし） |
+| 起動を跨いだ日のファイル名 | — | 退避分は **起動日** が付く（§3.5 副作用 1）。中身は行の時刻で判定する |
 
 ---
 
@@ -299,6 +530,24 @@ fields (toMillis(@timestamp) + 9 * 3600 * 1000) / 3600000 % 24 as jst_hour
 2. **`periodic-size-rotating-file-handler` の `max-backup-index` はサイズ連番にのみ効く。**
    日付サフィックス付きファイルは無限に増えるため、EFS ライフサイクル管理か
    定期削除ジョブが必須（`DESIGN.md` §11-3 と同種の課題）。
+   なお `rotate-on-boot=true` を入れたことで、この連番は
+   **「サイズ超過」と「起動時退避」の両方で消費される**ようになった。
+   `.1` が最新（逆時系列）である点にも注意。
+
+2-1. **クラッシュループ時に同一日の古い世代が失われる（RC-5 対策の副作用）。**
+   `max-backup-index=20` なら同一日に 20 回の再起動で当日分が一巡する。
+   EFS 上の世代は失われるが、`autoflush=true` により行は書かれた時点で
+   CloudWatch Agent に渡っているため **CloudWatch Logs 側には残る**。
+   EFS 上での完全な保全が要件なら `max-backup-index` を引き上げるか、
+   起動ごとにログディレクトリが変わる構成（ECS のタスク固有ディレクトリ）を採る。
+
+2-2. **`rotate-on-boot` が発火するのは「起動時に対象ファイルが既存」の場合だけ。**
+   ECS でタスクごとに `mid/<TASK_INSTANCE_ID>/` が変わる経路では発火しない。
+   設定しても症状が変わらない場合、まず §3.5.4 の表で自分の経路を確認すること
+   （その経路なら RC-5 自体が起きていない）。
+
+2-3. **退避ファイルの日付は「起動日」であり「中身の日付」ではない。**
+   §3.5 副作用 1。ファイル名を稼働統計の根拠に使わないこと（方針 4）。
 
 3. **タスク終了後のディレクトリが残置される。**
    `mid/task-*` と同様、アプリログのタスク固有ディレクトリにも定期削除が必要。
@@ -321,3 +570,18 @@ fields (toMillis(@timestamp) + 9 * 3600 * 1000) / 3600000 % 24 as jst_hour
    `timestamp_format` の `%z` は Agent が対応している前提の実装だが、
    使用中の Agent バージョンで必ず検証すること（手順は `docs/IMPLEMENTATION.md` §5）。
    非対応だった場合のフォールバックも同節に記載している。
+
+8. **Logback 側にも RC-5 と同じ構造がある（本実装のスコープ外）。**
+   `TimeBasedRollingPolicy`（`DefaultTimeBasedFileNamingAndTriggeringPolicy#start`）も、
+   `<file>` が指定されているとき **既存ファイルの `lastModified()` から現在周期を決める**。
+   したがって「クラッシュ前のファイルに追記し、名前は mtime で決まる」という
+   §3.5.1 の性質 A / B は Logback にも当てはまる。
+   ただし Logback には `rotate-on-boot` 相当の属性が無く、取りうる選択肢は次のとおり:
+
+   | 案 | 評価 |
+   |----|------|
+   | `<file>` を書かず `fileNamePattern` だけにする（アクティブファイル自体が日付付きになる） | 構造的には最も正しい。ただし `tracelog` → `tracelog.2026-09-02.0` とファイル名が変わり、本実装の「ファイル名を変えない」制約と CloudWatch Agent の glob 設計を壊す |
+   | 起動スクリプトで既存ファイルを退避してから起動 | 世代管理が Logback 側と二重になる |
+   | 現状維持（タスク固有ディレクトリで RC-3 を潰し、統計はイベント時刻で取る） | **本実装の選択**。ECS ではタスクごとにディレクトリが変わるため、Logback 側の RC-5 は実際には発生しにくい（§3.5.4 と同じ理屈） |
+
+   アプリログでも RC-5 を実測できた場合のみ、上の 1 案目を別途検討する。

@@ -41,6 +41,12 @@
         （分析書 RC-3）が構造的に発生しない。
         ここをサービス共有ディレクトリへ変更してはならない。
 
+        ※ タスクごとにディレクトリが変わる経路では起動時に server.log が
+          存在しないため rotate-on-boot は発火しない（無害）。RC-5 が実際に
+          起きるのは「同じディレクトリで JVM が起動し直る」経路
+          （EC2/オンプレの固定ログディレクトリ、同一タスク内のコンテナ再起動、
+          LOG_INSTANCE_ID を固定値で運用している場合）。→ 分析書 §3.5
+
       suffix=".yyyy-MM-dd"
         JVM 既定 TZ (= Asia/Tokyo) で解釈される日次サフィックス。
         server.log.2026-09-01 は JST 09-01 00:00:00〜23:59:59 の 1 日分。
@@ -52,14 +58,37 @@
         世代数には効かない（無限に増える）ため、EFS 側の
         ライフサイクル管理／定期削除ジョブが別途必要。
 
-      rotate-on-boot="false"
-        true にすると再起動のたびに新ファイルが作られ
-        「1 ファイル = 1 JST 日」が崩れる。稼働統計のため false 固定。
+        ★ rotate-on-boot は max-backup-index > 0 のときだけ動作する。
+          0 にすると RC-5 対策がエラーも警告も無く無効化される。
+          （PeriodicSizeRotatingFileHandler#setFile の条件:
+            rotateOnBoot && maxBackupIndex > 0 && file.exists() && file.length() > 0）
+
+      rotate-on-boot="true"   ★ RC-5 対策の本体 ★
+        起動時（file 属性の適用時）に既存の server.log が存在しサイズ > 0 なら、
+        **最初の 1 行を書く前に** server.log.<日付>.1 へ退避し、
+        空の server.log から書き始める。
+        これにより「クラッシュしたプロセスが残したファイルに再起動後の
+        プロセスが追記し続ける」状態が構造的に消え、ローテート前の日付が
+        付いたファイルへ再起動後のログが入らなくなる。
+
+        副作用（詳細は分析書 §3.5 / IMPLEMENTATION.md §2-5）:
+          1. 退避ファイルの日付は「内容の日付」ではなく「起動日」になる
+             （WildFly の属性適用順 ... ROTATE_ON_BOOT, SUFFIX, ..., FILE により
+               suffix 決定時点で file が未設定 → currentTimeMillis が使われる）。
+             → ファイル名ではなく行の時刻（+0900 付き）を正とすること。
+          2. 1 起動につき連番を 1 つ消費する（.N → .N+1、.max は削除）。
+          3. 設定変更後の初回起動だけ、ブートの数行が退避側の末尾に入る。
+
+      append="true"
+        rotate-on-boot=true と併用しても true のまま維持する。
+        退避に失敗した場合（EFS の rename 失敗・権限エラー等）、
+        append="false" だと直前の稼働分を切り詰めて破棄してしまう。
+        append="false" は RC-5 の対策にはならない（データ破壊を伴う）。
     -->
     <periodic-size-rotating-file-handler name="FILE"
                                          autoflush="true"
                                          append="true"
-                                         rotate-on-boot="false">
+                                         rotate-on-boot="true">
         <level name="INFO"/>
         <formatter>
             <named-formatter name="PATTERN"/>

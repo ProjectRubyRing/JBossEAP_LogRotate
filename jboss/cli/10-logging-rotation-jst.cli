@@ -1,9 +1,12 @@
 # =====================================================================
 # JBoss EAP: server.log の JST 固定ログローテーション設定
 #
-#   目的: ローテーション境界・ファイル名サフィックス・ログ行の時刻を
-#         すべて JST に揃え、「UTC で切られたファイルに JST 翌日の
-#         ログが入る」事象を構造的に発生させない。
+#   目的 1: ローテーション境界・ファイル名サフィックス・ログ行の時刻を
+#           すべて JST に揃え、「UTC で切られたファイルに JST 翌日の
+#           ログが入る」事象を構造的に発生させない（分析書 RC-1）。
+#   目的 2: 異常終了後の再起動で、再起動後のログが「ローテーション前の
+#           日付」のファイルに混入する事象を止める（分析書 RC-5）。
+#           → rotate-on-boot=true で対処する。
 #
 #   実行方法（サーバ未起動・standalone 構成を直接書き換え）:
 #       $JBOSS_HOME/bin/jboss-cli.sh --file=10-logging-rotation-jst.cli
@@ -44,6 +47,11 @@ embed-server --std-out=echo --server-config=standalone.xml
 #    これにより「行だけ見れば TZ が一意に決まる」状態になり、
 #    CloudWatch Agent 側の timezone 設定への依存が消える。
 #
+#    ※ RC-5 対策（rotate-on-boot）を入れると「ファイル名の日付」と
+#      「中身の日付」が意図的にずれるケースが出る（後述の副作用 1）。
+#      その場合の唯一の正は **行に印字された時刻** になるため、
+#      このオフセット印字は RC-5 対策の前提条件でもある。
+#
 #    ※ オフセットを付けたくない（既存パーサを一切変えたくない）場合は
 #      末尾の Z を外す。その場合は CloudWatch Agent 側で timestamp_format
 #      から %z を外し、サイドカーの TZ=Asia/Tokyo + timezone:"Local" に
@@ -67,6 +75,8 @@ end-if
 #    既定の FILE は periodic-rotating-file-handler（日付のみ）。
 #    日付だけだと 1 ファイルが無制限に肥大化し、EFS を圧迫したうえ
 #    CloudWatch Agent の追従も重くなる。日付 + サイズの両方で回す。
+#    加えて periodic-rotating-file-handler には rotate-on-boot 属性が
+#    存在しないため、RC-5 を塞ぐには型の変換そのものが必須である。
 #
 #    ハンドラ型の変更は「root-logger から外す → remove → add → 再割当」
 #    の順でなければ失敗する（割当中のハンドラは削除できない）。
@@ -79,6 +89,13 @@ end-if
 #      RC-3（複数タスクによる同名ファイルの多重書き込み）が構造的に起きない。
 #      ここをサービス共有ディレクトリへ変更してはならない。
 #
+#      ※ 逆に、タスクごとにディレクトリが変わる経路では起動時に
+#        server.log が存在しないため rotate-on-boot は発火しない（無害）。
+#        RC-5 が実際に起きるのは「同じディレクトリで JVM が起動し直る」
+#        経路（EC2/オンプレの固定ログディレクトリ、同一タスク内の
+#        コンテナ再起動、LOG_INSTANCE_ID を固定値で運用している場合）。
+#        詳細は docs/ANALYSIS_UTC_JST.md §3.5。
+#
 #    suffix:
 #      .yyyy-MM-dd = 日次ローテート。JVM 既定 TZ (=JST) で解釈される。
 #      → server.log.2026-09-01 は JST 09-01 00:00:00〜23:59:59 の 1 日分。
@@ -86,23 +103,66 @@ end-if
 #      ※ サフィックスの粒度がローテート周期を決める。分単位
 #        (".yyyy-MM-dd-HH-mm") は EFS 上のファイル数が爆発するため採用しない。
 #
-#    rotate-size / max-backup-index:
-#      同一 JST 日内でサイズ超過した場合は server.log.<日付>.1, .2 ... と連番。
-#      max-backup-index はこの「連番」にのみ効き、日付サフィックス付き
-#      ファイルの世代数には効かない（無限に増える）。
-#      → EFS ライフサイクル管理 or 定期削除ジョブが別途必須。
+#    rotate-size:
+#      同一 JST 日内でサイズ超過した場合に連番ファイルを作る閾値。
+#
+#    max-backup-index:
+#      「連番」の保持世代数。日付サフィックス付きファイル自体の世代数には
+#      効かない（無限に増える）ため、EFS ライフサイクル管理 or
+#      定期削除ジョブが別途必須。
+#      ★ rotate-on-boot は max-backup-index > 0 のときだけ動作する。
+#        0 にすると RC-5 対策が **エラーも警告も無く無効化** されるため、
+#        0 にしてはならない。
+#        （PeriodicSizeRotatingFileHandler#setFile の条件:
+#          rotateOnBoot && maxBackupIndex > 0 && file.exists() && file.length() > 0）
 #
 #    append=true:
-#      コンテナ再起動時に既存ファイルへ追記する。
-#      false だと同一 JST 日の前半のログが消える。
+#      rotate-on-boot=true と併用しても true のまま維持する。
+#      rotate-on-boot は「退避に成功したときだけ」空ファイルから始まる。
+#      EFS の rename 失敗・権限エラー等で退避できなかった場合、
+#      append=false だと直前の稼働分を **切り詰めて破棄** してしまう。
+#      append=true なら最悪でも「混在するが失われない」で済む。
+#      → append=false は RC-5 の対策にはならない（データ破壊を伴う）。
 #
 #    autoflush=true:
 #      1 行ごとに flush。CloudWatch Agent が即座に読めるようにする。
 #      クラッシュ直前のログを失わないためにも本番では true。
 #
-#    rotate-on-boot=false:
-#      true にすると再起動のたびに新ファイルが作られ、
-#      「1 ファイル = 1 JST 日」が崩れる。稼働統計のため false 固定。
+#    rotate-on-boot=true:  ★ RC-5 対策の本体 ★
+#      起動時（file 属性の適用時）に、既存の server.log が存在し
+#      かつ サイズ > 0 なら、**最初の 1 行を書く前に**
+#      server.log.<日付>.1 へ退避し、空の server.log から書き始める。
+#
+#      これにより「クラッシュしたプロセスが残したファイルに、再起動後の
+#      プロセスが追記し続ける」状態が構造的に消える。
+#      追記が起きない以上、ローテート前の日付が付いたファイルへ
+#      再起動後のログが入ることもない。
+#
+#      【副作用 1: 退避ファイルの日付は "内容の日付" ではなく "起動日"】
+#        WildFly は属性を ..., ROTATE_ON_BOOT, SUFFIX, NAMED_FORMATTER, FILE
+#        の順で適用する（PeriodicSizeRotatingHandlerResourceDefinition）。
+#        suffix 適用時点ではまだ file が未設定なので、退避に使うサフィックスは
+#        file.lastModified() ではなく System.currentTimeMillis()
+#        = **起動時刻** から作られる。
+#        → 09-01 に落ちて 09-02 に起動すると、09-01 の内容が
+#          server.log.2026-09-02.1 に入る（日付が前方にずれる）。
+#        ファイル名ではなく行の時刻（+0900 付き）を正とすること。
+#        tools/verify-log-rotation.sh はこれを [BOOT-ROT] として
+#        RC-1/RC-3 の異常と区別する。
+#
+#      【副作用 2: 1 起動につき連番を 1 つ消費する】
+#        退避は SuffixRotator の連番シフト（.N → .N+1、.max は削除）で
+#        行われる。同一日に再起動を繰り返すと古い世代から消えていく。
+#        max-backup-index=20 なら「同一日に 20 回再起動」で当日分が一巡する。
+#        クラッシュループ時の保険は CloudWatch Logs 側（送信済みイベント）。
+#
+#      【副作用 3: 設定変更後の初回起動だけ、ブートの数行が退避側に入る】
+#        logging サブシステム初期化前のブート数行は standalone.xml ではなく
+#        configuration/logging.properties の設定で書かれる。同ファイルは
+#        起動のたびに現行モデルから再生成されるため、この症状は
+#        「rotate-on-boot=true を入れた直後の 1 回だけ」で解消する。
+#        影響は数行・サブ秒であり、RC-5 の「再起動後セッション丸ごと混入」
+#        とは桁が違う。docs/IMPLEMENTATION.md §2-5 の手順で実測すること。
 # ---------------------------------------------------------------------
 if (outcome == success) of /subsystem=logging/periodic-rotating-file-handler=FILE:read-resource
     /subsystem=logging/root-logger=ROOT:remove-handler(name=FILE)
@@ -114,7 +174,7 @@ if (outcome == success) of /subsystem=logging/periodic-rotating-file-handler=FIL
         max-backup-index=20, \
         append=true, \
         autoflush=true, \
-        rotate-on-boot=false, \
+        rotate-on-boot=true, \
         level=INFO, \
         named-formatter=PATTERN)
     /subsystem=logging/root-logger=ROOT:add-handler(name=FILE)
@@ -124,22 +184,35 @@ end-if
 # 上のブロックで変換した直後）は属性を再適用する。
 # ※ FILE ハンドラがどちらの型でも存在しない独自構成の場合、このブロックは
 #   何も実行されない。その場合は上の :add(...) を手動で実行すること。
+#
+# 順序に意味がある: max-backup-index を先に確定させてから rotate-on-boot を
+# 立てる。max-backup-index=0 の状態で rotate-on-boot=true にしても
+# 「エラーにならず何も起きない」ため、設定ミスに気付けない。
 if (outcome == success) of /subsystem=logging/periodic-size-rotating-file-handler=FILE:read-resource
     /subsystem=logging/periodic-size-rotating-file-handler=FILE:write-attribute(name=suffix, value=".yyyy-MM-dd")
     /subsystem=logging/periodic-size-rotating-file-handler=FILE:write-attribute(name=rotate-size, value="100m")
     /subsystem=logging/periodic-size-rotating-file-handler=FILE:write-attribute(name=max-backup-index, value=20)
     /subsystem=logging/periodic-size-rotating-file-handler=FILE:write-attribute(name=append, value=true)
     /subsystem=logging/periodic-size-rotating-file-handler=FILE:write-attribute(name=autoflush, value=true)
-    /subsystem=logging/periodic-size-rotating-file-handler=FILE:write-attribute(name=rotate-on-boot, value=false)
+    /subsystem=logging/periodic-size-rotating-file-handler=FILE:write-attribute(name=rotate-on-boot, value=true)
     /subsystem=logging/periodic-size-rotating-file-handler=FILE:write-attribute(name=named-formatter, value=PATTERN)
 end-if
 
 
 # ---------------------------------------------------------------------
 # 3. 設定内容の確認出力
+#
+#    RC-5 対策は rotate-on-boot=true / max-backup-index>0 / append=true の
+#    3 点が同時に成立して初めて効く。max-backup-index=0 だと
+#    rotate-on-boot は無言で効かないため、必ず目視で確認すること。
 # ---------------------------------------------------------------------
 echo "=== 適用後の FILE ハンドラ ==="
 /subsystem=logging/periodic-size-rotating-file-handler=FILE:read-resource(include-defaults=true)
+
+echo "=== RC-5 対策の必須 3 属性（rotate-on-boot=true / max-backup-index>0 / append=true）==="
+/subsystem=logging/periodic-size-rotating-file-handler=FILE:read-attribute(name=rotate-on-boot)
+/subsystem=logging/periodic-size-rotating-file-handler=FILE:read-attribute(name=max-backup-index)
+/subsystem=logging/periodic-size-rotating-file-handler=FILE:read-attribute(name=append)
 
 echo "=== 適用後の PATTERN フォーマッタ ==="
 /subsystem=logging/pattern-formatter=PATTERN:read-resource
