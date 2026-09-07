@@ -1,0 +1,109 @@
+{
+  "_comment": "ECS タスク定義（抜粋）: TZ 固定 + EFS ログ + CloudWatch Agent サイドカー。<AWS_ACCOUNT_ID>/<REGION>/<FS-ID>/<AP-ID> は実値に置換すること。CWA_Sidecar_Generator/taskdef-sidecar-snippet.json からの差分は (1) 全コンテナへの TZ=Asia/Tokyo (2) アプリコンテナへの LOG_INSTANCE_ID (3) サイドカーの state ディレクトリ永続化 の 3 点。",
+
+  "family": "jbosseap-app-task",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "2048",
+  "memory": "4096",
+  "executionRoleArn": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/jbosseap-ecs-execution-role",
+  "taskRoleArn": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/jbosseap-ecs-task-role",
+
+  "volumes": [
+    {
+      "name": "efs-logs",
+      "efsVolumeConfiguration": {
+        "fileSystemId": "fs-<FS-ID>",
+        "transitEncryption": "ENABLED",
+        "authorizationConfig": {
+          "accessPointId": "fsap-<AP-ID>",
+          "iam": "ENABLED"
+        },
+        "rootDirectory": "/"
+      }
+    },
+    {
+      "_comment": "CloudWatch Agent の読み取りオフセット(state)を保持する。サイドカー再起動時の全件再送を防ぐ。ログ本体用マウント(readOnly)とは別マウントポイントにする必要がある。",
+      "name": "efs-cwagent-state",
+      "efsVolumeConfiguration": {
+        "fileSystemId": "fs-<FS-ID>",
+        "transitEncryption": "ENABLED",
+        "authorizationConfig": {
+          "accessPointId": "fsap-<AP-ID-STATE>",
+          "iam": "ENABLED"
+        },
+        "rootDirectory": "/"
+      }
+    }
+  ],
+
+  "containerDefinitions": [
+    {
+      "name": "front-svc",
+      "image": "<AWS_ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/jbosseap-front:latest",
+      "essential": true,
+
+      "_comment_env": "TZ はコンテナ OS と JVM の両方に効く。JDK は内蔵 tzdb を参照するため、イメージに tzdata が入っていなくても Asia/Tokyo を解決できる。ただし date(1) 等 OS 側コマンドを JST で使いたい場合は tzdata が必要。LOG_INSTANCE_ID は entrypoint が Task Metadata V4 から解決して上書きする（ここでの値はフォールバック）。",
+      "environment": [
+        { "name": "TZ", "value": "Asia/Tokyo" },
+        { "name": "LOG_OUT_DIR", "value": "/mnt/logs/front-svc" }
+      ],
+
+      "mountPoints": [
+        { "sourceVolume": "efs-logs", "containerPath": "/mnt/logs", "readOnly": false }
+      ]
+    },
+
+    {
+      "name": "back-svc",
+      "image": "<AWS_ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/jbosseap-back:latest",
+      "essential": true,
+      "environment": [
+        { "name": "TZ", "value": "Asia/Tokyo" },
+        { "name": "LOG_OUT_DIR", "value": "/mnt/logs/back-svc" }
+      ],
+      "mountPoints": [
+        { "sourceVolume": "efs-logs", "containerPath": "/mnt/logs", "readOnly": false }
+      ]
+    },
+
+    {
+      "name": "cloudwatch-agent",
+      "image": "public.ecr.aws/cloudwatch-agent/cloudwatch-agent:latest",
+      "essential": false,
+      "user": "0",
+
+      "_comment_env": "TZ=Asia/Tokyo は timestamp_format の timezone:\"Local\" を JST として解決させるためのフォールバック。ログ行に +0900 が入っていれば %z が優先されるため通常は使われないが、書式から Z を外した場合に無言で 9 時間ずれるのを防ぐ。CloudWatch Agent は Go 実装のため OS の tzdata に依存する。イメージに zoneinfo が無い場合 Local は UTC にフォールバックするので、%z 併用を必須とする。",
+      "environment": [
+        { "name": "TZ", "value": "Asia/Tokyo" }
+      ],
+
+      "mountPoints": [
+        { "sourceVolume": "efs-logs", "containerPath": "/mnt/logs", "readOnly": true },
+        { "sourceVolume": "efs-cwagent-state", "containerPath": "/opt/aws/amazon-cloudwatch-agent/logs/state", "readOnly": false }
+      ],
+
+      "dependsOn": [
+        { "containerName": "front-svc", "condition": "START" },
+        { "containerName": "back-svc", "condition": "START" }
+      ],
+
+      "secrets": [
+        {
+          "name": "CW_CONFIG_CONTENT",
+          "valueFrom": "arn:aws:secretsmanager:<REGION>:<AWS_ACCOUNT_ID>:secret:jbosseap/cwagent/config-XXXXXX"
+        }
+      ],
+
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/jbosseap/cwagent-selflog",
+          "awslogs-region": "<REGION>",
+          "awslogs-stream-prefix": "cwagent",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ]
+}

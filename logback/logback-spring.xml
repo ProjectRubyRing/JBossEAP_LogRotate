@@ -1,0 +1,437 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    ログ出力構成（JST 固定ローテーション対応版）
+
+    dhapp_2/src/main/resources/logback-spring.xml の差し替え版。
+    元ファイルからの変更点は 3 点のみで、ログの内容・レベル・ファイル名は変えていない。
+
+    ┌─ 変更 1: ローテーション境界とファイル名の日付を JST に固定 ────────────┐
+    │  fileNamePattern の %d に第 2 引数で TZ を指定する。                    │
+    │      変更前: %d{yyyy-MM-dd}                → JVM 既定 TZ (=UTC)        │
+    │      変更後: %d{yyyy-MM-dd, Asia/Tokyo}    → 常に JST                  │
+    │                                                                        │
+    │  Logback の TimeBasedRollingPolicy は、この %d の TZ から               │
+    │  RollingCalendar を構築してローテート境界を計算する。                   │
+    │  つまり TZ をここで固定すれば、JVM の TZ 設定に関係なく                 │
+    │  「1 ファイル = 1 JST 日」が保証される。                                │
+    └────────────────────────────────────────────────────────────────────────┘
+
+    ┌─ 変更 2: ログ行のタイムスタンプを JST 固定 + オフセット印字 ───────────┐
+    │      変更前: %d{yyyy-MM-dd HH:mm:ss.SSS}                               │
+    │      変更後: %d{yyyy-MM-dd HH:mm:ss.SSSZ, Asia/Tokyo}                  │
+    │      出力例: 2026-09-02 00:14:03.424+0900                              │
+    │                                                                        │
+    │  行だけ見れば TZ が一意に決まるため、CloudWatch Agent の timezone       │
+    │  設定への依存が消える。移行期も「+0900 の有無」で新旧を判別できる。     │
+    └────────────────────────────────────────────────────────────────────────┘
+
+    ┌─ 変更 3: 出力先をタスク固有ディレクトリへ分離（多重書き込みの根絶）────┐
+    │      変更前: ${LOG_OUT_DIR}/tracelog                                   │
+    │      変更後: ${LOG_OUT_DIR}/${LOG_INSTANCE_ID}/tracelog                │
+    │                                                                        │
+    │  EFS のサービス共有ディレクトリに複数タスクが同名ファイルを開くと、     │
+    │  あるタスクの rename 後も他タスクが旧 inode へ書き続けるため、          │
+    │  ローテート済みファイルに何時間も後のログが混入する。                   │
+    │  （ECS_EFS_Dockerfile_Symboliclink/docs/DESIGN.md §11-1 の既知リスク）  │
+    │                                                                        │
+    │  ファイル名は変えずディレクトリで分けるため、既存の運用手順・           │
+    │  grep 対象名は一切変わらない。                                          │
+    │  さらに CloudWatch Agent の glob を                                     │
+    │      /mnt/logs/<svc>/*/tracelog                                        │
+    │  と書けるようになり、ローテート済みファイルに一致しない                 │
+    │  （= 二重送信が構造的に起きない）。                                     │
+    └────────────────────────────────────────────────────────────────────────┘
+
+    このアプリは WildFly(JBoss EAP) に WAR デプロイされるが、
+    jboss-deployment-structure.xml で logging サブシステムを除外しているため、
+    ログ出力はこの war 内の Logback（Spring Boot 標準バインディング）が担う。
+-->
+<configuration>
+
+    <!--
+        ===== タイムゾーン =====
+        ローテート境界・ファイル名の日付・ログ行の時刻すべてに適用する。
+        全レイヤを UTC 運用へ切り替える場合は、ここを UTC に変えるだけでよい
+        （CloudWatch Agent 側の設定も合わせて変更すること）。
+    -->
+    <property name="LOG_TZ" value="Asia/Tokyo"/>
+
+    <!-- 出力ルートディレクトリ（環境変数 LOG_OUT_DIR）。未設定ならカレント配下 ./logs -->
+    <property name="LOG_OUT_DIR" value="${LOG_OUT_DIR:-logs}"/>
+
+    <!--
+        ===== タスク固有ディレクトリ名 =====
+        ECS 起動スクリプト（entrypoint）が Task Metadata Endpoint V4 から
+        取得した TaskARN 末尾を LOG_INSTANCE_ID 環境変数で渡す。
+        JBoss サーバログが既に採用している mid/<TASK_INSTANCE_ID> と同じ値を
+        使うことで、アプリログとサーバログを同じタスク単位で突き合わせられる。
+
+        ローカル開発・単一プロセス実行時は未設定でよく、"local" 配下に出る。
+    -->
+    <property name="LOG_INSTANCE_ID" value="${LOG_INSTANCE_ID:-local}"/>
+
+    <!-- 実際の出力先ディレクトリ（1 タスク専有） -->
+    <property name="LOG_DIR" value="${LOG_OUT_DIR}/${LOG_INSTANCE_ID}"/>
+
+    <!-- JBoss サーバログ相当の出力先（mid 配下・タスク固有） -->
+    <property name="MID_DIR" value="${LOG_OUT_DIR}/mid/${LOG_INSTANCE_ID}"/>
+
+    <!--
+        ===== 共通のローテーション設定値 =====
+        maxHistory は「日数」ではなく「fileNamePattern の %d の粒度での世代数」。
+        %d{yyyy-MM-dd} なら 14 = 14 日分。
+        タスク固有ディレクトリになったため、maxHistory / totalSizeCap の削除処理が
+        他タスクのログを消すことはない（変更 3 の副次効果）。
+    -->
+    <property name="ROTATE_MAX_SIZE"  value="50MB"/>
+    <property name="ROTATE_HISTORY"   value="14"/>
+    <property name="ROTATE_TOTAL_CAP" value="1GB"/>
+
+    <!--
+        ===== アプリログ用パターン（詳細・requestId 追跡しやすい形式） =====
+        末尾の Z が UTC オフセット (+0900) を出力する。
+        第 2 引数 ${LOG_TZ} で TZ を固定するため、JVM の TZ 設定に依存しない。
+    -->
+    <property name="APP_PATTERN"
+              value="%d{yyyy-MM-dd HH:mm:ss.SSSZ, ${LOG_TZ}} %-5level [%thread] %logger{48} - %msg%n%ex"/>
+
+    <!--
+        JBoss EAP standalone の server.log 既定パターンに合わせる。
+        EAP:  %d{yyyy-MM-dd HH:mm:ss,SSSZ} %-5p [%c] (%t) %s%e%n
+        （ミリ秒がカンマ区切り、レベル・カテゴリ・スレッド・メッセージ・例外）
+
+        注意: Logback の %d{...} はカンマをオプション区切り（第2引数=タイムゾーンID）と
+        解釈するため、日付パターン自体にカンマを含める場合は
+        **日付パターンだけをダブルクォートで囲む**。囲まないと Logback 1.5 系では
+        ZoneRulesException: Unknown time-zone ID: SSS で初期化に失敗する。
+    -->
+    <property name="SERVER_PATTERN"
+              value='%d{"yyyy-MM-dd HH:mm:ss,SSSZ", ${LOG_TZ}} %-5level [%logger] (%thread) %msg%n%ex'/>
+
+    <!-- ===== コンソール（開発・コンテナ標準出力用） ===== -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>${APP_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- ===== アプリログ: LOG_DIR/application.log ===== -->
+    <appender name="APP_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/application.log</file>
+        <!-- CloudWatch Agent が遅延なく読めるよう 1 イベントごとに flush する -->
+        <immediateFlush>true</immediateFlush>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/application.%d{yyyy-MM-dd, ${LOG_TZ}}.%i.log</fileNamePattern>
+            <maxFileSize>${ROTATE_MAX_SIZE}</maxFileSize>
+            <maxHistory>${ROTATE_HISTORY}</maxHistory>
+            <totalSizeCap>${ROTATE_TOTAL_CAP}</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${APP_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!--
+        ===== エラーログ: LOG_DIR/error.log =====
+        ERROR レベルのみを通す。例外は %ex により標準の Java スタックトレース形式で
+        （"Caused by:" / "... N more" を含めて）複数行に展開される。
+        各エントリは必ず先頭がタイムスタンプで始まるため、CloudWatch Agent 側で
+        multi_line_start_pattern に "^\d{4}-\d{2}-\d{2}" を指定すれば
+        スタックトレース全体を 1 イベントとして扱える。
+    -->
+    <appender name="ERROR_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/error.log</file>
+        <immediateFlush>true</immediateFlush>
+        <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
+            <level>ERROR</level>
+        </filter>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/error.%d{yyyy-MM-dd, ${LOG_TZ}}.%i.log</fileNamePattern>
+            <maxFileSize>${ROTATE_MAX_SIZE}</maxFileSize>
+            <maxHistory>${ROTATE_HISTORY}</maxHistory>
+            <totalSizeCap>${ROTATE_TOTAL_CAP}</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${APP_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!--
+        ===== サーバログ: MID_DIR/server.log =====
+        JBoss EAP のサーバログ相当を EAP 既定フォーマットで出力する。
+        root に接続し、Spring/WildFly 由来を含む全カテゴリのログを収集する。
+        EAP 本体の server.log と同じ mid/<TASK_INSTANCE_ID>/ 配下に出すため、
+        CloudWatch Agent の収集定義を 1 本にまとめられる。
+    -->
+    <appender name="SERVER_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${MID_DIR}/server.log</file>
+        <immediateFlush>true</immediateFlush>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${MID_DIR}/server.%d{yyyy-MM-dd, ${LOG_TZ}}.%i.log</fileNamePattern>
+            <maxFileSize>${ROTATE_MAX_SIZE}</maxFileSize>
+            <maxHistory>${ROTATE_HISTORY}</maxHistory>
+            <totalSizeCap>${ROTATE_TOTAL_CAP}</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${SERVER_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!--
+        ===== 各 REST アプリの処理内容ログ（複数ファイル・同一内容） =====
+        各 REST API（demo / db / cache / external）が処理した内容（リクエスト・処理ステップ・
+        レスポンス・処理時間）を、以下の各ファイルへ「全て同じ内容」で必ず出力する。
+
+          keax0003.log      xxxxxxxxxx.err   accesslog        tracelog
+          dbiolog           inputmsglog      outputmsglog     asyncdriver.log
+          authlog           connectinlog     connectoutlog    asyncdriver_xxxxx.err
+    -->
+    <appender name="KEAX_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/keax0003.log</file>
+        <immediateFlush>true</immediateFlush>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/keax0003.%d{yyyy-MM-dd, ${LOG_TZ}}.%i.log</fileNamePattern>
+            <maxFileSize>${ROTATE_MAX_SIZE}</maxFileSize>
+            <maxHistory>${ROTATE_HISTORY}</maxHistory>
+            <totalSizeCap>${ROTATE_TOTAL_CAP}</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${APP_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <appender name="ERR_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/xxxxxxxxxx.err</file>
+        <immediateFlush>true</immediateFlush>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/xxxxxxxxxx.%d{yyyy-MM-dd, ${LOG_TZ}}.%i.err</fileNamePattern>
+            <maxFileSize>${ROTATE_MAX_SIZE}</maxFileSize>
+            <maxHistory>${ROTATE_HISTORY}</maxHistory>
+            <totalSizeCap>${ROTATE_TOTAL_CAP}</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${APP_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <appender name="ACCESS_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/accesslog</file>
+        <immediateFlush>true</immediateFlush>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/accesslog.%d{yyyy-MM-dd, ${LOG_TZ}}.%i</fileNamePattern>
+            <maxFileSize>${ROTATE_MAX_SIZE}</maxFileSize>
+            <maxHistory>${ROTATE_HISTORY}</maxHistory>
+            <totalSizeCap>${ROTATE_TOTAL_CAP}</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${APP_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!--
+        ===== 報告事象の対象ファイル =====
+        tracelog.2026-09-01-19 に 2026-09-02 00:14:03.424 が混入していた件は、
+        この appender の設定に起因する。
+          - fileNamePattern の %d が UTC で解釈されていた（9 時間ずれ）
+          - 複数タスクが共有ディレクトリの同名ファイルを開いていた（無制限のずれ）
+        いずれも本設定で解消する。
+    -->
+    <appender name="TRACE_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/tracelog</file>
+        <immediateFlush>true</immediateFlush>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/tracelog.%d{yyyy-MM-dd, ${LOG_TZ}}.%i</fileNamePattern>
+            <maxFileSize>${ROTATE_MAX_SIZE}</maxFileSize>
+            <maxHistory>${ROTATE_HISTORY}</maxHistory>
+            <totalSizeCap>${ROTATE_TOTAL_CAP}</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${APP_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <appender name="DBIO_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/dbiolog</file>
+        <immediateFlush>true</immediateFlush>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/dbiolog.%d{yyyy-MM-dd, ${LOG_TZ}}.%i</fileNamePattern>
+            <maxFileSize>${ROTATE_MAX_SIZE}</maxFileSize>
+            <maxHistory>${ROTATE_HISTORY}</maxHistory>
+            <totalSizeCap>${ROTATE_TOTAL_CAP}</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${APP_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <appender name="INPUTMSG_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/inputmsglog</file>
+        <immediateFlush>true</immediateFlush>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/inputmsglog.%d{yyyy-MM-dd, ${LOG_TZ}}.%i</fileNamePattern>
+            <maxFileSize>${ROTATE_MAX_SIZE}</maxFileSize>
+            <maxHistory>${ROTATE_HISTORY}</maxHistory>
+            <totalSizeCap>${ROTATE_TOTAL_CAP}</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${APP_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <appender name="OUTPUTMSG_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/outputmsglog</file>
+        <immediateFlush>true</immediateFlush>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/outputmsglog.%d{yyyy-MM-dd, ${LOG_TZ}}.%i</fileNamePattern>
+            <maxFileSize>${ROTATE_MAX_SIZE}</maxFileSize>
+            <maxHistory>${ROTATE_HISTORY}</maxHistory>
+            <totalSizeCap>${ROTATE_TOTAL_CAP}</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${APP_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <appender name="ASYNCDRIVER_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/asyncdriver.log</file>
+        <immediateFlush>true</immediateFlush>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/asyncdriver.%d{yyyy-MM-dd, ${LOG_TZ}}.%i.log</fileNamePattern>
+            <maxFileSize>${ROTATE_MAX_SIZE}</maxFileSize>
+            <maxHistory>${ROTATE_HISTORY}</maxHistory>
+            <totalSizeCap>${ROTATE_TOTAL_CAP}</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${APP_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <appender name="AUTH_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/authlog</file>
+        <immediateFlush>true</immediateFlush>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/authlog.%d{yyyy-MM-dd, ${LOG_TZ}}.%i</fileNamePattern>
+            <maxFileSize>${ROTATE_MAX_SIZE}</maxFileSize>
+            <maxHistory>${ROTATE_HISTORY}</maxHistory>
+            <totalSizeCap>${ROTATE_TOTAL_CAP}</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${APP_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <appender name="CONNECTIN_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/connectinlog</file>
+        <immediateFlush>true</immediateFlush>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/connectinlog.%d{yyyy-MM-dd, ${LOG_TZ}}.%i</fileNamePattern>
+            <maxFileSize>${ROTATE_MAX_SIZE}</maxFileSize>
+            <maxHistory>${ROTATE_HISTORY}</maxHistory>
+            <totalSizeCap>${ROTATE_TOTAL_CAP}</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${APP_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <appender name="CONNECTOUT_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/connectoutlog</file>
+        <immediateFlush>true</immediateFlush>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/connectoutlog.%d{yyyy-MM-dd, ${LOG_TZ}}.%i</fileNamePattern>
+            <maxFileSize>${ROTATE_MAX_SIZE}</maxFileSize>
+            <maxHistory>${ROTATE_HISTORY}</maxHistory>
+            <totalSizeCap>${ROTATE_TOTAL_CAP}</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${APP_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!--
+        asyncdriver_xxxxx.err … xxxxxxxxxx.err と同様、拡張子 .err の固定ファイル名で出力する。
+        （xxxxx 部分はファイル名の一部としてそのまま扱う）
+    -->
+    <appender name="ASYNCDRIVER_ERR_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/asyncdriver_xxxxx.err</file>
+        <immediateFlush>true</immediateFlush>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/asyncdriver_xxxxx.%d{yyyy-MM-dd, ${LOG_TZ}}.%i.err</fileNamePattern>
+            <maxFileSize>${ROTATE_MAX_SIZE}</maxFileSize>
+            <maxHistory>${ROTATE_HISTORY}</maxHistory>
+            <totalSizeCap>${ROTATE_TOTAL_CAP}</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${APP_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!--
+        ===== mid ディレクトリ配下に出力するログ: MID_DIR/gc.log =====
+        server.log と同様、mid/<TASK_INSTANCE_ID> を挟んで出力する。
+    -->
+    <appender name="GC_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${MID_DIR}/gc.log</file>
+        <immediateFlush>true</immediateFlush>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${MID_DIR}/gc.%d{yyyy-MM-dd, ${LOG_TZ}}.%i.log</fileNamePattern>
+            <maxFileSize>${ROTATE_MAX_SIZE}</maxFileSize>
+            <maxHistory>${ROTATE_HISTORY}</maxHistory>
+            <totalSizeCap>${ROTATE_TOTAL_CAP}</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${APP_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!--
+        アプリ本体（各 REST API 機能）は DEBUG まで詳細に出力する。
+        application.log に加え、上記すべてのファイルへ同じ処理内容を必ず出力する。
+        additivity=true のまま root にも伝播させ、server.log（全体）と error.log（ERROR のみ）にも載せる。
+    -->
+    <logger name="com.example.dhapp" level="DEBUG">
+        <appender-ref ref="APP_FILE"/>
+        <appender-ref ref="KEAX_FILE"/>
+        <appender-ref ref="ERR_FILE"/>
+        <appender-ref ref="ACCESS_FILE"/>
+        <appender-ref ref="TRACE_FILE"/>
+        <appender-ref ref="DBIO_FILE"/>
+        <appender-ref ref="INPUTMSG_FILE"/>
+        <appender-ref ref="OUTPUTMSG_FILE"/>
+        <appender-ref ref="ASYNCDRIVER_FILE"/>
+        <appender-ref ref="AUTH_FILE"/>
+        <appender-ref ref="CONNECTIN_FILE"/>
+        <appender-ref ref="CONNECTOUT_FILE"/>
+        <appender-ref ref="ASYNCDRIVER_ERR_FILE"/>
+        <appender-ref ref="GC_FILE"/>
+    </logger>
+
+    <!-- JTA/トランザクションの詳細を追いたい場合に有効化しやすいよう明示しておく -->
+    <logger name="org.springframework.transaction" level="INFO"/>
+    <logger name="org.springframework.jdbc.core" level="INFO"/>
+
+    <!-- root: コンソール・サーバログ（EAP 形式・全体）・エラーログ（ERROR のみ） -->
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="SERVER_FILE"/>
+        <appender-ref ref="ERROR_FILE"/>
+    </root>
+
+</configuration>

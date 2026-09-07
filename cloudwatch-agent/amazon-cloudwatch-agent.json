@@ -1,0 +1,148 @@
+{
+  "agent": {
+    "run_as_user": "root",
+    "debug": false,
+    "logfile": "/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log"
+  },
+  "logs": {
+    "force_flush_interval": 5,
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/mnt/logs/front-svc/mid/*/server.log",
+            "log_group_name": "/ecs/jbosseap/front/server",
+            "log_stream_name": "front/server/{hostname}",
+            "timestamp_format": "%Y-%m-%d %H:%M:%S,%f%z",
+            "timezone": "Local",
+            "multi_line_start_pattern": "{timestamp_format}",
+            "encoding": "utf-8",
+            "retention_in_days": 90,
+            "auto_removal": false
+          },
+          {
+            "file_path": "/mnt/logs/front-svc/*/application.log",
+            "log_group_name": "/ecs/jbosseap/front/application",
+            "log_stream_name": "front/application/{hostname}",
+            "timestamp_format": "%Y-%m-%d %H:%M:%S.%f%z",
+            "timezone": "Local",
+            "multi_line_start_pattern": "{timestamp_format}",
+            "encoding": "utf-8",
+            "retention_in_days": 30,
+            "auto_removal": false
+          },
+          {
+            "file_path": "/mnt/logs/front-svc/*/error.log",
+            "log_group_name": "/ecs/jbosseap/front/error",
+            "log_stream_name": "front/error/{hostname}",
+            "timestamp_format": "%Y-%m-%d %H:%M:%S.%f%z",
+            "timezone": "Local",
+            "multi_line_start_pattern": "{timestamp_format}",
+            "encoding": "utf-8",
+            "retention_in_days": 90,
+            "auto_removal": false
+          },
+          {
+            "file_path": "/mnt/logs/front-svc/*/tracelog",
+            "log_group_name": "/ecs/jbosseap/front/trace",
+            "log_stream_name": "front/trace/{hostname}",
+            "timestamp_format": "%Y-%m-%d %H:%M:%S.%f%z",
+            "timezone": "Local",
+            "multi_line_start_pattern": "{timestamp_format}",
+            "encoding": "utf-8",
+            "retention_in_days": 30,
+            "auto_removal": false
+          },
+          {
+            "file_path": "/mnt/logs/front-svc/*/alert.log",
+            "log_group_name": "/ecs/jbosseap/front/alert",
+            "log_stream_name": "front/alert/{hostname}",
+            "timestamp_format": "%Y-%m-%d %H:%M:%S.%f%z",
+            "timezone": "Local",
+            "multi_line_start_pattern": "{timestamp_format}",
+            "encoding": "utf-8",
+            "retention_in_days": 90,
+            "auto_removal": false
+          },
+          {
+            "file_path": "/mnt/logs/front-svc/*/io.log",
+            "log_group_name": "/ecs/jbosseap/front/io",
+            "log_stream_name": "front/io/{hostname}",
+            "timestamp_format": "%Y-%m-%d %H:%M:%S.%f%z",
+            "timezone": "Local",
+            "multi_line_start_pattern": "{timestamp_format}",
+            "encoding": "utf-8",
+            "retention_in_days": 30,
+            "auto_removal": false
+          },
+          {
+            "file_path": "/mnt/logs/back-svc/mid/*/server.log",
+            "log_group_name": "/ecs/jbosseap/back/server",
+            "log_stream_name": "back/server/{hostname}",
+            "timestamp_format": "%Y-%m-%d %H:%M:%S,%f%z",
+            "timezone": "Local",
+            "multi_line_start_pattern": "{timestamp_format}",
+            "encoding": "utf-8",
+            "retention_in_days": 90,
+            "auto_removal": false
+          },
+          {
+            "file_path": "/mnt/logs/back-svc/*/application.log",
+            "log_group_name": "/ecs/jbosseap/back/application",
+            "log_stream_name": "back/application/{hostname}",
+            "timestamp_format": "%Y-%m-%d %H:%M:%S.%f%z",
+            "timezone": "Local",
+            "multi_line_start_pattern": "{timestamp_format}",
+            "encoding": "utf-8",
+            "retention_in_days": 30,
+            "auto_removal": false
+          },
+          {
+            "file_path": "/mnt/logs/back-svc/*/error.log",
+            "log_group_name": "/ecs/jbosseap/back/error",
+            "log_stream_name": "back/error/{hostname}",
+            "timestamp_format": "%Y-%m-%d %H:%M:%S.%f%z",
+            "timezone": "Local",
+            "multi_line_start_pattern": "{timestamp_format}",
+            "encoding": "utf-8",
+            "retention_in_days": 90,
+            "auto_removal": false
+          },
+          {
+            "file_path": "/mnt/logs/back-svc/*/tracelog",
+            "log_group_name": "/ecs/jbosseap/back/trace",
+            "log_stream_name": "back/trace/{hostname}",
+            "timestamp_format": "%Y-%m-%d %H:%M:%S.%f%z",
+            "timezone": "Local",
+            "multi_line_start_pattern": "{timestamp_format}",
+            "encoding": "utf-8",
+            "retention_in_days": 30,
+            "auto_removal": false
+          },
+          {
+            "file_path": "/mnt/logs/back-svc/*/alert.log",
+            "log_group_name": "/ecs/jbosseap/back/alert",
+            "log_stream_name": "back/alert/{hostname}",
+            "timestamp_format": "%Y-%m-%d %H:%M:%S.%f%z",
+            "timezone": "Local",
+            "multi_line_start_pattern": "{timestamp_format}",
+            "encoding": "utf-8",
+            "retention_in_days": 90,
+            "auto_removal": false
+          },
+          {
+            "file_path": "/mnt/logs/back-svc/*/io.log",
+            "log_group_name": "/ecs/jbosseap/back/io",
+            "log_stream_name": "back/io/{hostname}",
+            "timestamp_format": "%Y-%m-%d %H:%M:%S.%f%z",
+            "timezone": "Local",
+            "multi_line_start_pattern": "{timestamp_format}",
+            "encoding": "utf-8",
+            "retention_in_days": 30,
+            "auto_removal": false
+          }
+        ]
+      }
+    }
+  }
+}

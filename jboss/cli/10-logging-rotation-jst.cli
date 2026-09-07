@@ -1,0 +1,150 @@
+# =====================================================================
+# JBoss EAP: server.log の JST 固定ログローテーション設定
+#
+#   目的: ローテーション境界・ファイル名サフィックス・ログ行の時刻を
+#         すべて JST に揃え、「UTC で切られたファイルに JST 翌日の
+#         ログが入る」事象を構造的に発生させない。
+#
+#   実行方法（サーバ未起動・standalone 構成を直接書き換え）:
+#       $JBOSS_HOME/bin/jboss-cli.sh --file=10-logging-rotation-jst.cli
+#
+#   冪等性: 再実行しても同じ結果になる。
+#           1 回目: periodic-rotating-file-handler → periodic-size-rotating-file-handler へ変換
+#           2 回目以降: 属性の再適用のみ
+#
+# ---------------------------------------------------------------------
+# 【前提: これ単体では JST 化は完了しない】
+#
+#   logging サブシステムには suffix に適用する TZ を指定する属性が無い。
+#   PeriodicRotatingFileHandler / PeriodicSizeRotatingFileHandler は
+#   内部で TimeZone.getDefault() を使うため、
+#   **JVM 既定 TZ が suffix の TZ を決める唯一の制御点**である。
+#
+#   したがって本 CLI と必ずセットで以下を適用すること:
+#       - jboss/conf/01-timezone.conf   (-Duser.timezone=Asia/Tokyo)
+#       - ECS タスク定義の環境変数       (TZ=Asia/Tokyo)
+#
+#   使用中の EAP で属性の有無を確認する場合:
+#       /subsystem=logging/periodic-size-rotating-file-handler=FILE:read-resource-description
+# =====================================================================
+
+# 未起動状態の standalone 構成を編集するため embed-server で起動
+embed-server --std-out=echo --server-config=standalone.xml
+
+
+# ---------------------------------------------------------------------
+# 1. pattern-formatter: タイムスタンプに UTC オフセットを印字する
+#
+#    EAP 既定:  %d{yyyy-MM-dd HH:mm:ss,SSS} %-5p [%c] (%t) %s%e%n
+#    変更後  :  %d{yyyy-MM-dd HH:mm:ss,SSSZ} ...
+#                                        ^^^ SimpleDateFormat の Z = +0900
+#
+#    出力例: 2026-09-02 00:14:03,424+0900 INFO  [com.example.Foo] (default task-1) ...
+#
+#    これにより「行だけ見れば TZ が一意に決まる」状態になり、
+#    CloudWatch Agent 側の timezone 設定への依存が消える。
+#
+#    ※ オフセットを付けたくない（既存パーサを一切変えたくない）場合は
+#      末尾の Z を外す。その場合は CloudWatch Agent 側で timestamp_format
+#      から %z を外し、サイドカーの TZ=Asia/Tokyo + timezone:"Local" に
+#      頼ることになる（docs/IMPLEMENTATION.md §5 のフォールバック構成）。
+# ---------------------------------------------------------------------
+/subsystem=logging/pattern-formatter=PATTERN:write-attribute( \
+    name=pattern, \
+    value="%d{yyyy-MM-dd HH:mm:ss,SSSZ} %-5p [%c] (%t) %s%e%n")
+
+# コンソール（ECS の awslogs ドライバへ流れる）も同一書式に揃える
+if (outcome == success) of /subsystem=logging/pattern-formatter=COLOR-PATTERN:read-resource
+    /subsystem=logging/pattern-formatter=COLOR-PATTERN:write-attribute( \
+        name=pattern, \
+        value="%K{level}%d{yyyy-MM-dd HH:mm:ss,SSSZ} %-5p [%c] (%t) %s%e%n")
+end-if
+
+
+# ---------------------------------------------------------------------
+# 2. FILE ハンドラを periodic-size-rotating-file-handler へ置換
+#
+#    既定の FILE は periodic-rotating-file-handler（日付のみ）。
+#    日付だけだと 1 ファイルが無制限に肥大化し、EFS を圧迫したうえ
+#    CloudWatch Agent の追従も重くなる。日付 + サイズの両方で回す。
+#
+#    ハンドラ型の変更は「root-logger から外す → remove → add → 再割当」
+#    の順でなければ失敗する（割当中のハンドラは削除できない）。
+#
+#    file:
+#      relative-to=jboss.server.log.dir を維持する。
+#      ECS 構成では起動スクリプトが -Djboss.server.log.dir に
+#      /mnt/logs/<comp>/logs/<svc>/mid/<TASK_INSTANCE_ID> を渡すため、
+#      server.log は「1 タスク 1 ディレクトリ」となり
+#      RC-3（複数タスクによる同名ファイルの多重書き込み）が構造的に起きない。
+#      ここをサービス共有ディレクトリへ変更してはならない。
+#
+#    suffix:
+#      .yyyy-MM-dd = 日次ローテート。JVM 既定 TZ (=JST) で解釈される。
+#      → server.log.2026-09-01 は JST 09-01 00:00:00〜23:59:59 の 1 日分。
+#      時間帯別の稼働統計が必要なら ".yyyy-MM-dd-HH"（毎時ローテート）にする。
+#      ※ サフィックスの粒度がローテート周期を決める。分単位
+#        (".yyyy-MM-dd-HH-mm") は EFS 上のファイル数が爆発するため採用しない。
+#
+#    rotate-size / max-backup-index:
+#      同一 JST 日内でサイズ超過した場合は server.log.<日付>.1, .2 ... と連番。
+#      max-backup-index はこの「連番」にのみ効き、日付サフィックス付き
+#      ファイルの世代数には効かない（無限に増える）。
+#      → EFS ライフサイクル管理 or 定期削除ジョブが別途必須。
+#
+#    append=true:
+#      コンテナ再起動時に既存ファイルへ追記する。
+#      false だと同一 JST 日の前半のログが消える。
+#
+#    autoflush=true:
+#      1 行ごとに flush。CloudWatch Agent が即座に読めるようにする。
+#      クラッシュ直前のログを失わないためにも本番では true。
+#
+#    rotate-on-boot=false:
+#      true にすると再起動のたびに新ファイルが作られ、
+#      「1 ファイル = 1 JST 日」が崩れる。稼働統計のため false 固定。
+# ---------------------------------------------------------------------
+if (outcome == success) of /subsystem=logging/periodic-rotating-file-handler=FILE:read-resource
+    /subsystem=logging/root-logger=ROOT:remove-handler(name=FILE)
+    /subsystem=logging/periodic-rotating-file-handler=FILE:remove
+    /subsystem=logging/periodic-size-rotating-file-handler=FILE:add( \
+        file={"relative-to" => "jboss.server.log.dir", "path" => "server.log"}, \
+        suffix=".yyyy-MM-dd", \
+        rotate-size="100m", \
+        max-backup-index=20, \
+        append=true, \
+        autoflush=true, \
+        rotate-on-boot=false, \
+        level=INFO, \
+        named-formatter=PATTERN)
+    /subsystem=logging/root-logger=ROOT:add-handler(name=FILE)
+end-if
+
+# 既に periodic-size-rotating-file-handler の場合（= 2 回目以降の実行、または
+# 上のブロックで変換した直後）は属性を再適用する。
+# ※ FILE ハンドラがどちらの型でも存在しない独自構成の場合、このブロックは
+#   何も実行されない。その場合は上の :add(...) を手動で実行すること。
+if (outcome == success) of /subsystem=logging/periodic-size-rotating-file-handler=FILE:read-resource
+    /subsystem=logging/periodic-size-rotating-file-handler=FILE:write-attribute(name=suffix, value=".yyyy-MM-dd")
+    /subsystem=logging/periodic-size-rotating-file-handler=FILE:write-attribute(name=rotate-size, value="100m")
+    /subsystem=logging/periodic-size-rotating-file-handler=FILE:write-attribute(name=max-backup-index, value=20)
+    /subsystem=logging/periodic-size-rotating-file-handler=FILE:write-attribute(name=append, value=true)
+    /subsystem=logging/periodic-size-rotating-file-handler=FILE:write-attribute(name=autoflush, value=true)
+    /subsystem=logging/periodic-size-rotating-file-handler=FILE:write-attribute(name=rotate-on-boot, value=false)
+    /subsystem=logging/periodic-size-rotating-file-handler=FILE:write-attribute(name=named-formatter, value=PATTERN)
+end-if
+
+
+# ---------------------------------------------------------------------
+# 3. 設定内容の確認出力
+# ---------------------------------------------------------------------
+echo "=== 適用後の FILE ハンドラ ==="
+/subsystem=logging/periodic-size-rotating-file-handler=FILE:read-resource(include-defaults=true)
+
+echo "=== 適用後の PATTERN フォーマッタ ==="
+/subsystem=logging/pattern-formatter=PATTERN:read-resource
+
+echo "=== root-logger のハンドラ割当 ==="
+/subsystem=logging/root-logger=ROOT:read-resource
+
+stop-embedded-server

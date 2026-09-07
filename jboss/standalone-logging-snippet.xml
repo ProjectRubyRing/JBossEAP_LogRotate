@@ -1,0 +1,120 @@
+<!--
+  =====================================================================
+  standalone.xml の logging サブシステム抜粋（jboss-cli を使わない場合）
+
+  jboss/cli/10-logging-rotation-jst.cli を適用した結果と等価な XML。
+  CLI が使えない環境（既存の standalone.xml をそのまま配布する運用など）
+  では、この内容で <subsystem xmlns="urn:jboss:domain:logging:*"> 配下を
+  置き換える。
+
+  【必須の前提】
+    このファイル単体では JST 化は完了しない。
+    suffix の TZ は JVM 既定 TZ に従うため、必ず以下を併用すること:
+      - jboss/conf/01-timezone.conf  (-Duser.timezone=Asia/Tokyo)
+      - ECS タスク定義の TZ=Asia/Tokyo
+  =====================================================================
+-->
+<subsystem xmlns="urn:jboss:domain:logging:8.0">
+
+    <!--
+      console-handler: ECS の awslogs ログドライバへ流れる。
+      ファイルログと同一書式（オフセット付き）に揃えることで、
+      CloudWatch 上で両者を同じクエリで扱える。
+    -->
+    <console-handler name="CONSOLE">
+        <level name="INFO"/>
+        <formatter>
+            <named-formatter name="COLOR-PATTERN"/>
+        </formatter>
+    </console-handler>
+
+    <!--
+      ===============================================================
+      FILE: server.log の日次 + サイズローテーション
+      ===============================================================
+
+      relative-to="jboss.server.log.dir"
+        ECS 構成では起動スクリプトが
+          -Djboss.server.log.dir=/mnt/logs/<comp>/logs/<svc>/mid/<TASK_INSTANCE_ID>
+        を渡すため、server.log は「1 タスク 1 ディレクトリ」になる。
+        これにより、rename 後の旧 inode へ他タスクが書き続ける事象
+        （分析書 RC-3）が構造的に発生しない。
+        ここをサービス共有ディレクトリへ変更してはならない。
+
+      suffix=".yyyy-MM-dd"
+        JVM 既定 TZ (= Asia/Tokyo) で解釈される日次サフィックス。
+        server.log.2026-09-01 は JST 09-01 00:00:00〜23:59:59 の 1 日分。
+        時間帯別統計が必要なら ".yyyy-MM-dd-HH" に変更する。
+
+      rotate-size / max-backup-index
+        同一 JST 日内でサイズ超過した場合の連番。
+        max-backup-index は「連番」にのみ効き、日付付きファイルの
+        世代数には効かない（無限に増える）ため、EFS 側の
+        ライフサイクル管理／定期削除ジョブが別途必要。
+
+      rotate-on-boot="false"
+        true にすると再起動のたびに新ファイルが作られ
+        「1 ファイル = 1 JST 日」が崩れる。稼働統計のため false 固定。
+    -->
+    <periodic-size-rotating-file-handler name="FILE"
+                                         autoflush="true"
+                                         append="true"
+                                         rotate-on-boot="false">
+        <level name="INFO"/>
+        <formatter>
+            <named-formatter name="PATTERN"/>
+        </formatter>
+        <file relative-to="jboss.server.log.dir" path="server.log"/>
+        <rotate-size value="100m"/>
+        <max-backup-index value="20"/>
+        <suffix value=".yyyy-MM-dd"/>
+    </periodic-size-rotating-file-handler>
+
+    <logger category="com.arjuna">
+        <level name="WARN"/>
+    </logger>
+    <logger category="io.jaegertracing.Configuration">
+        <level name="WARN"/>
+    </logger>
+    <logger category="org.jboss.as.config">
+        <level name="DEBUG"/>
+    </logger>
+    <logger category="sun.rmi">
+        <level name="WARN"/>
+    </logger>
+
+    <root-logger>
+        <level name="INFO"/>
+        <handlers>
+            <handler name="CONSOLE"/>
+            <handler name="FILE"/>
+        </handlers>
+    </root-logger>
+
+    <!--
+      ===============================================================
+      フォーマッタ: タイムスタンプに UTC オフセットを印字する
+      ===============================================================
+
+      EAP 既定:  %d{yyyy-MM-dd HH:mm:ss,SSS}
+      変更後  :  %d{yyyy-MM-dd HH:mm:ss,SSSZ}
+                                          ^ SimpleDateFormat の Z = +0900
+
+      出力例:
+        2026-09-02 00:14:03,424+0900 INFO  [com.example.Foo] (default task-1) ...
+
+      これにより行だけ見れば TZ が一意に決まり、
+      CloudWatch Agent 側の timezone 設定への依存が消える。
+      移行期に「オフセット無し = 旧 UTC ログ」と機械的に判別できる利点もある。
+
+      ※ オフセットを付けない構成にする場合は末尾の Z を外し、
+        CloudWatch Agent 側も timestamp_format から %z を外すこと。
+    -->
+    <formatter name="PATTERN">
+        <pattern-formatter pattern="%d{yyyy-MM-dd HH:mm:ss,SSSZ} %-5p [%c] (%t) %s%e%n"/>
+    </formatter>
+    <formatter name="COLOR-PATTERN">
+        <pattern-formatter pattern="%K{level}%d{yyyy-MM-dd HH:mm:ss,SSSZ} %-5p [%c] (%t) %s%e%n"/>
+    </formatter>
+
+</subsystem>
